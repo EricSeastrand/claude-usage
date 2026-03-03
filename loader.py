@@ -14,18 +14,21 @@ CLAUDE_DIR = Path.home() / ".claude" / "projects"
 def discover_session_files(
     hours: int | None = None,
     date: str | None = None,
+    path: str | None = None,
 ) -> list[Path]:
-    """Find all session JSONL files under ~/.claude/projects/.
+    """Find all session JSONL files under a Claude projects directory.
 
     Args:
         hours: Only include files modified within this many hours.
         date: Only include files modified on this date (YYYY-MM-DD).
               If both hours and date are None, returns all files.
+        path: Custom path to projects directory (default: ~/.claude/projects).
     """
-    if not CLAUDE_DIR.exists():
+    base = Path(path) if path else CLAUDE_DIR
+    if not base.exists():
         return []
 
-    all_files = sorted(CLAUDE_DIR.glob("*/*.jsonl"))
+    all_files = sorted(base.glob("*/*.jsonl"))
 
     if date:
         target = datetime.strptime(date, "%Y-%m-%d").date()

@@ -1,7 +1,7 @@
 """Analyze tool call result sizes from raw Claude Code session JSONL files."""
 
+import argparse
 import json
-import sys
 from pathlib import Path
 from collections import defaultdict
 
@@ -113,8 +113,14 @@ def fmt(n):
 
 
 def main():
-    all_files = sorted(CLAUDE_DIR.glob("*/*.jsonl"))
-    print(f"Scanning {len(all_files)} session files...")
+    parser = argparse.ArgumentParser(description="Analyze tool result sizes")
+    parser.add_argument("--path", type=str, help="Path to Claude projects directory (default: ~/.claude/projects)")
+    args = parser.parse_args()
+
+    claude_dir = Path(args.path) if args.path else CLAUDE_DIR
+
+    all_files = sorted(claude_dir.glob("*/*.jsonl"))
+    print(f"Scanning {len(all_files)} session files in {claude_dir}...")
 
     results = extract_tool_results(all_files)
     print(f"Found {len(results)} tool results total.\n")

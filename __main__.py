@@ -4,11 +4,11 @@ Analyzes token usage and estimates costs from Claude Code's local session
 files (~/.claude/projects/). Uses DuckDB for fast SQL queries over JSONL.
 
 Usage:
-    .venv/bin/python -m claude_usage summary [--hours N | --date YYYY-MM-DD | --all]
-    .venv/bin/python -m claude_usage sessions [--hours N | --date YYYY-MM-DD | --all]
-    .venv/bin/python -m claude_usage session <id-prefix>
-    .venv/bin/python -m claude_usage search <keyword>
-    .venv/bin/python -m claude_usage daily [--hours N | --date YYYY-MM-DD | --all]
+    .venv/bin/python -m claude_usage summary [--hours N | --date YYYY-MM-DD | --all] [--path DIR]
+    .venv/bin/python -m claude_usage sessions [--hours N | --date YYYY-MM-DD | --all] [--path DIR]
+    .venv/bin/python -m claude_usage session <id-prefix> [--path DIR]
+    .venv/bin/python -m claude_usage search <keyword> [--path DIR]
+    .venv/bin/python -m claude_usage daily [--hours N | --date YYYY-MM-DD | --all] [--path DIR]
 """
 
 import argparse
@@ -22,6 +22,10 @@ from .reports import (
     print_sessions,
     print_summary,
 )
+
+
+def _add_common_flags(parser: argparse.ArgumentParser):
+    parser.add_argument("--path", type=str, help="Path to Claude projects directory (default: ~/.claude/projects)")
 
 
 def _add_time_flags(parser: argparse.ArgumentParser):
@@ -41,6 +45,7 @@ def _resolve_time(args) -> dict:
 
 def _load(args):
     time_kwargs = _resolve_time(args)
+    time_kwargs["path"] = getattr(args, "path", None)
     files = discover_session_files(**time_kwargs)
     if not files:
         time_desc = "matching your filter" if time_kwargs else "at all"
@@ -65,22 +70,27 @@ def main():
     # summary
     p_summary = subparsers.add_parser("summary", help="Aggregate usage + cost breakdown")
     _add_time_flags(p_summary)
+    _add_common_flags(p_summary)
 
     # sessions
     p_sessions = subparsers.add_parser("sessions", help="Per-session usage list")
     _add_time_flags(p_sessions)
+    _add_common_flags(p_sessions)
 
     # session detail
     p_session = subparsers.add_parser("session", help="Detailed view of one session")
     p_session.add_argument("id", help="Session ID or prefix")
+    _add_common_flags(p_session)
 
     # search
     p_search = subparsers.add_parser("search", help="Find sessions by prompt text")
     p_search.add_argument("keyword", help="Search term")
+    _add_common_flags(p_search)
 
     # daily
     p_daily = subparsers.add_parser("daily", help="Daily usage breakdown")
     _add_time_flags(p_daily)
+    _add_common_flags(p_daily)
 
     args = parser.parse_args()
 
@@ -88,15 +98,16 @@ def main():
         parser.print_help()
         sys.exit(1)
 
+    custom_path = getattr(args, "path", None)
+
     if args.command == "session":
-        # Session detail needs all files to find the session
-        conn = load_usage_records(discover_session_files())
+        conn = load_usage_records(discover_session_files(path=custom_path))
         if conn is None:
             print("\n  No usage records found.")
             sys.exit(0)
         print_session_detail(conn, args.id)
     elif args.command == "search":
-        conn = load_usage_records(discover_session_files())
+        conn = load_usage_records(discover_session_files(path=custom_path))
         if conn is None:
             print("\n  No usage records found.")
             sys.exit(0)
