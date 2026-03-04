@@ -1,5 +1,9 @@
 """Report formatting for Claude Code usage analysis."""
 
+from collections import defaultdict
+from datetime import datetime
+from typing import Generator
+
 import duckdb
 
 from .pricing import compute_cost, get_pricing
@@ -320,3 +324,117 @@ def print_search(conn: duckdb.DuckDBPyConnection, keyword: str):
     headers = ["Session", "Started", "Calls", "Cost", "Prompt"]
     _table(headers, rows, ["l", "l", "r", "r", "l"])
     print()
+
+
+def _parse_ts(ts_str: str) -> datetime | None:
+    """Parse an ISO 8601 timestamp string."""
+    if not ts_str:
+        return None
+    try:
+        return datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _fmt_duration(start: datetime, end: datetime) -> str:
+    """Format a duration between two datetimes."""
+    delta = end - start
+    total_sec = int(delta.total_seconds())
+    if total_sec < 60:
+        return f"{total_sec}s"
+    if total_sec < 3600:
+        return f"{total_sec // 60}m"
+    hours = total_sec // 3600
+    minutes = (total_sec % 3600) // 60
+    return f"{hours}h {minutes}m"
+
+
+def print_timeline(
+    session_id: str,
+    project: str,
+    messages: list[dict],
+    full: bool = False,
+):
+    """Print a conversation timeline for a session."""
+    if not messages:
+        print(f"\n  No messages found in session {session_id[:8]}")
+        return
+
+    first_ts = _parse_ts(messages[0]["timestamp"])
+    last_ts = _parse_ts(messages[-1]["timestamp"])
+
+    print(f"\n  Session:  {session_id}")
+    print(f"  Project:  {project}")
+    if first_ts and last_ts:
+        print(f"  Duration: {first_ts.strftime('%Y-%m-%d %H:%M')} -> "
+              f"{last_ts.strftime('%H:%M')} ({_fmt_duration(first_ts, last_ts)})")
+    print(f"  Messages: {len(messages)}")
+    print()
+
+    for msg in messages:
+        ts = _parse_ts(msg["timestamp"])
+        time_str = ts.strftime("%H:%M:%S") if ts else "??:??:??"
+        role = msg["role"]
+        text = msg["text"]
+        tools = msg["tools"]
+
+        role_tag = "[user]     " if role == "user" else "[assistant]"
+
+        if full:
+            # Show complete message text
+            lines = text.split("\n")
+            print(f"  {time_str}  {role_tag}  {lines[0]}")
+            indent = " " * 24
+            for line in lines[1:]:
+                print(f"{indent}{line}")
+        else:
+            # Condensed: first ~120 chars on one line
+            snippet = text.replace("\n", " ")[:120]
+            if len(text) > 120:
+                snippet += "..."
+            print(f"  {time_str}  {role_tag}  {snippet}")
+
+        # Show tool uses as indented lines
+        if tools:
+            indent = " " * 24
+            for tool in tools:
+                print(f"{indent}-> {tool}")
+
+    print()
+
+
+def print_grep_results(results: Generator[dict, None, None], pattern: str):
+    """Print grep results grouped by session."""
+    grouped: dict[str, list[dict]] = defaultdict(list)
+    for r in results:
+        grouped[r["session_id"]].append(r)
+
+    if not grouped:
+        print(f"\n  No matches for '{pattern}'")
+        return
+
+    total_matches = sum(len(v) for v in grouped.values())
+    print(f"\n  {total_matches} matches in {len(grouped)} sessions\n")
+
+    for session_id, matches in grouped.items():
+        first = matches[0]
+        ts = _parse_ts(first["timestamp"])
+        ts_str = ts.strftime("%m-%d %H:%M") if ts else "?"
+        print(f"  Session {session_id[:8]} ({ts_str}) {first['project']}")
+
+        for m in matches:
+            mts = _parse_ts(m["timestamp"])
+            mts_str = mts.strftime("%H:%M:%S") if mts else "?"
+            role_tag = f"[{m['role']}]"
+            # Show snippet around match
+            text = m["text"]
+            start = max(0, m["match_start"] - 40)
+            end = min(len(text), m["match_end"] + 40)
+            snippet = text[start:end].replace("\n", " ")
+            if start > 0:
+                snippet = "..." + snippet
+            if end < len(text):
+                snippet = snippet + "..."
+            print(f"    {mts_str}  {role_tag:13s}  {snippet}")
+
+        print()

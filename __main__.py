@@ -9,18 +9,28 @@ Usage:
     .venv/bin/python -m claude_usage session <id-prefix> [--path DIR]
     .venv/bin/python -m claude_usage search <keyword> [--path DIR]
     .venv/bin/python -m claude_usage daily [--hours N | --date YYYY-MM-DD | --all] [--path DIR]
+    .venv/bin/python -m claude_usage timeline <id-prefix> [--full] [--path DIR]
+    .venv/bin/python -m claude_usage grep <pattern> [--hours N | --date YYYY-MM-DD | --all] [--path DIR]
 """
 
 import argparse
 import sys
 
-from .loader import discover_session_files, load_usage_records
+from .loader import (
+    discover_session_files,
+    find_session_file,
+    grep_messages,
+    load_session_messages,
+    load_usage_records,
+)
 from .reports import (
     print_daily,
+    print_grep_results,
     print_search,
     print_session_detail,
     print_sessions,
     print_summary,
+    print_timeline,
 )
 
 
@@ -92,6 +102,18 @@ def main():
     _add_time_flags(p_daily)
     _add_common_flags(p_daily)
 
+    # timeline
+    p_timeline = subparsers.add_parser("timeline", help="Conversation timeline for a session")
+    p_timeline.add_argument("id", help="Session ID or prefix")
+    p_timeline.add_argument("--full", action="store_true", help="Show full message text")
+    _add_common_flags(p_timeline)
+
+    # grep
+    p_grep = subparsers.add_parser("grep", help="Search all messages across sessions")
+    p_grep.add_argument("pattern", help="Regex pattern to search for")
+    _add_time_flags(p_grep)
+    _add_common_flags(p_grep)
+
     args = parser.parse_args()
 
     if not args.command:
@@ -118,6 +140,25 @@ def main():
         print_sessions(_load(args))
     elif args.command == "daily":
         print_daily(_load(args))
+    elif args.command == "timeline":
+        session_file = find_session_file(args.id, path=custom_path)
+        if session_file is None:
+            sys.exit(1)
+        messages = load_session_messages(session_file)
+        print_timeline(
+            session_id=session_file.stem,
+            project=session_file.parent.name,
+            messages=messages,
+            full=args.full,
+        )
+    elif args.command == "grep":
+        time_kwargs = _resolve_time(args)
+        time_kwargs["path"] = custom_path
+        files = discover_session_files(**time_kwargs)
+        if not files:
+            print("\n  No session files found matching your filter.")
+            sys.exit(0)
+        print_grep_results(grep_messages(files, args.pattern), args.pattern)
 
 
 if __name__ == "__main__":
