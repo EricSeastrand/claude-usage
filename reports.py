@@ -438,3 +438,322 @@ def print_grep_results(results: Generator[dict, None, None], pattern: str):
             print(f"    {mts_str}  {role_tag:13s}  {snippet}")
 
         print()
+
+
+# ---------------------------------------------------------------------------
+# New reports: compaction, context growth, efficiency, sources
+# ---------------------------------------------------------------------------
+
+
+def print_compactions(conn: duckdb.DuckDBPyConnection):
+    """Print sessions that hit compaction, with context stats."""
+    result = conn.execute("""
+        WITH comp_stats AS (
+            SELECT
+                c.session_id,
+                c.project,
+                COUNT(*) as num_compactions,
+                MIN(c.turn_number) as first_compaction_turn,
+                MAX(c.pre_tokens) as max_pre_tokens,
+                MIN(c.timestamp) as first_compaction_ts
+            FROM compactions c
+            GROUP BY c.session_id, c.project
+        ),
+        session_stats AS (
+            SELECT
+                session_id,
+                project,
+                MAX(turn_number) as total_turns,
+                MAX(effective_context) as peak_context,
+                SUM(input_tokens) as input_tok,
+                SUM(output_tokens) as output_tok,
+                SUM(cache_write_5m_tokens) as cw5m,
+                SUM(cache_write_1h_tokens) as cw1h,
+                SUM(cache_read_tokens) as cr,
+                FIRST(model) as model,
+                FIRST(first_prompt) as prompt
+            FROM usage
+            WHERE NOT is_subagent
+            GROUP BY session_id, project
+        )
+        SELECT
+            cs.session_id,
+            cs.project,
+            cs.num_compactions,
+            cs.first_compaction_turn,
+            cs.max_pre_tokens,
+            ss.total_turns,
+            ss.peak_context,
+            ss.model,
+            ss.input_tok, ss.output_tok, ss.cw5m, ss.cw1h, ss.cr,
+            ss.prompt
+        FROM comp_stats cs
+        JOIN session_stats ss ON cs.session_id = ss.session_id
+        ORDER BY cs.num_compactions DESC, cs.max_pre_tokens DESC
+    """).fetchall()
+
+    if not result:
+        print("\n  No compaction events found.")
+        return
+
+    total_compactions = sum(r[2] for r in result)
+    print(f"\n  {len(result)} sessions with compaction ({total_compactions} total events)\n")
+
+    rows = []
+    for (sid, proj, n_comp, first_turn, max_pre, total_turns,
+         peak_ctx, model, inp, out, cw5m, cw1h, cr, prompt) in result:
+        rates = get_pricing(model)
+        cost = compute_cost(inp, out, cw5m, cw1h, cr, rates)
+        prompt_snippet = (prompt or "")[:40]
+        if len(prompt or "") > 40:
+            prompt_snippet += "..."
+        rows.append([
+            sid[:8],
+            str(n_comp),
+            str(first_turn),
+            str(total_turns),
+            _fmt_tokens(max_pre),
+            _fmt_tokens(peak_ctx),
+            _fmt_cost(cost),
+            prompt_snippet,
+        ])
+
+    headers = ["Session", "Compacts", "1st@Turn", "Turns", "MaxPre", "PeakCtx", "Cost", "Prompt"]
+    _table(headers, rows, ["l", "r", "r", "r", "r", "r", "r", "l"])
+    print()
+
+
+def print_context_growth(conn: duckdb.DuckDBPyConnection, session_prefix: str):
+    """Print per-turn context growth for a session, with compaction markers."""
+    matches = conn.execute(
+        "SELECT DISTINCT session_id FROM usage WHERE session_id LIKE ? AND NOT is_subagent",
+        [f"{session_prefix}%"],
+    ).fetchall()
+
+    if not matches:
+        print(f"\n  No session found matching '{session_prefix}'")
+        return
+    if len(matches) > 1:
+        print(f"\n  Multiple sessions match '{session_prefix}':")
+        for (sid,) in matches[:10]:
+            print(f"    {sid}")
+        return
+
+    session_id = matches[0][0]
+
+    # Get compaction turn numbers for this session
+    comp_turns = set()
+    comp_rows = conn.execute(
+        "SELECT turn_number FROM compactions WHERE session_id = ?",
+        [session_id],
+    ).fetchall()
+    for (t,) in comp_rows:
+        comp_turns.add(t)
+
+    result = conn.execute("""
+        SELECT
+            turn_number,
+            timestamp,
+            effective_context,
+            input_tokens,
+            cache_read_tokens,
+            output_tokens,
+            model
+        FROM usage
+        WHERE session_id = ? AND NOT is_subagent
+        ORDER BY turn_number
+    """, [session_id]).fetchall()
+
+    if not result:
+        print(f"\n  No usage records for session {session_id[:8]}")
+        return
+
+    model = result[0][6]
+    peak_ctx = max(r[2] for r in result)
+
+    print(f"\n  Session: {session_id}")
+    print(f"  Model:   {model}")
+    print(f"  Turns:   {len(result)}")
+    print(f"  Peak:    {_fmt_tokens(peak_ctx)}")
+    if comp_turns:
+        print(f"  Compactions: {len(comp_turns)} (at turns {', '.join(str(t) for t in sorted(comp_turns))})")
+    print()
+
+    # Bar chart: context size per turn
+    max_bar = 50
+    rows = []
+    for turn, ts, eff_ctx, inp, cr, out, _model in result:
+        time_str = ts.strftime("%H:%M:%S") if ts else "?"
+        bar_len = int((eff_ctx / peak_ctx) * max_bar) if peak_ctx > 0 else 0
+        bar = "#" * bar_len
+
+        # Mark compaction boundaries
+        marker = " <<< COMPACTED" if turn in comp_turns else ""
+
+        # Warn when >80% of peak
+        if eff_ctx > peak_ctx * 0.8 and not marker:
+            marker = " !"
+
+        rows.append(f"  {turn:3d}  {time_str}  {_fmt_tokens(eff_ctx):>6s}  {bar}{marker}")
+
+    for row in rows:
+        print(row)
+    print()
+
+
+def print_efficiency(conn: duckdb.DuckDBPyConnection):
+    """Print aggregate efficiency metrics."""
+    # Total sessions (non-subagent)
+    total_sessions = conn.execute(
+        "SELECT COUNT(DISTINCT session_id) FROM usage WHERE NOT is_subagent"
+    ).fetchone()[0]
+
+    # Sessions with compaction
+    compacted_sessions = conn.execute(
+        "SELECT COUNT(DISTINCT session_id) FROM compactions"
+    ).fetchone()[0]
+
+    # Average turns before first compaction
+    avg_turns_to_compact = conn.execute("""
+        SELECT AVG(first_turn) FROM (
+            SELECT session_id, MIN(turn_number) as first_turn
+            FROM compactions
+            GROUP BY session_id
+        )
+    """).fetchone()[0]
+
+    # Total cost breakdown: parent vs subagent
+    parent_cost_data = conn.execute("""
+        SELECT
+            SUM(input_tokens) as inp,
+            SUM(output_tokens) as out,
+            SUM(cache_write_5m_tokens) as cw5m,
+            SUM(cache_write_1h_tokens) as cw1h,
+            SUM(cache_read_tokens) as cr,
+            FIRST(model) as model
+        FROM usage WHERE NOT is_subagent
+    """).fetchone()
+
+    sub_cost_data = conn.execute("""
+        SELECT
+            SUM(input_tokens) as inp,
+            SUM(output_tokens) as out,
+            SUM(cache_write_5m_tokens) as cw5m,
+            SUM(cache_write_1h_tokens) as cw1h,
+            SUM(cache_read_tokens) as cr,
+            FIRST(model) as model
+        FROM usage WHERE is_subagent
+    """).fetchone()
+
+    # Cost per user turn (non-subagent sessions)
+    user_turns = conn.execute("""
+        SELECT COUNT(DISTINCT session_id || '-' || turn_number)
+        FROM usage WHERE NOT is_subagent
+    """).fetchone()[0]
+
+    def _safe_cost(row):
+        if not row or row[0] is None:
+            return 0.0
+        rates = get_pricing(row[5] or "unknown")
+        return compute_cost(row[0], row[1], row[2], row[3], row[4], rates)
+
+    parent_cost = _safe_cost(parent_cost_data)
+    sub_cost = _safe_cost(sub_cost_data)
+    total_cost = parent_cost + sub_cost
+
+    compaction_rate = (compacted_sessions / total_sessions * 100) if total_sessions > 0 else 0
+    cost_per_turn = (parent_cost / user_turns) if user_turns > 0 else 0
+    sub_pct = (sub_cost / total_cost * 100) if total_cost > 0 else 0
+
+    print(f"\n  Sessions:              {total_sessions}")
+    print(f"  With compaction:       {compacted_sessions} ({compaction_rate:.1f}%)")
+    if avg_turns_to_compact:
+        print(f"  Avg turns to compact:  {avg_turns_to_compact:.0f}")
+    print(f"  Total cost:            {_fmt_cost(total_cost)}")
+    print(f"    Parent sessions:     {_fmt_cost(parent_cost)}")
+    print(f"    Subagents:           {_fmt_cost(sub_cost)} ({sub_pct:.1f}%)")
+    print(f"  Cost per turn:         {_fmt_cost(cost_per_turn)}")
+    print()
+
+    # Weekly trend
+    weekly = conn.execute("""
+        SELECT
+            DATE_TRUNC('week', timestamp)::DATE as week,
+            COUNT(DISTINCT session_id) as sessions,
+            COUNT(DISTINCT CASE WHEN session_id IN (
+                SELECT DISTINCT session_id FROM compactions
+            ) THEN session_id END) as compacted,
+            SUM(input_tokens) as inp,
+            SUM(output_tokens) as out,
+            SUM(cache_write_5m_tokens) as cw5m,
+            SUM(cache_write_1h_tokens) as cw1h,
+            SUM(cache_read_tokens) as cr,
+            FIRST(model) as model
+        FROM usage
+        WHERE NOT is_subagent
+        GROUP BY DATE_TRUNC('week', timestamp)::DATE
+        ORDER BY week DESC
+        LIMIT 8
+    """).fetchall()
+
+    if weekly:
+        print("  Weekly trend:\n")
+        rows = []
+        for week, sessions, compacted, inp, out, cw5m, cw1h, cr, model in weekly:
+            rates = get_pricing(model or "unknown")
+            cost = compute_cost(inp, out, cw5m, cw1h, cr, rates)
+            comp_rate = f"{compacted/sessions*100:.0f}%" if sessions > 0 else "0%"
+            rows.append([
+                str(week),
+                str(sessions),
+                f"{compacted} ({comp_rate})",
+                _fmt_cost(cost),
+            ])
+        headers = ["Week", "Sessions", "Compacted", "Cost"]
+        _table(headers, rows, ["l", "r", "r", "r"])
+        print()
+
+
+def print_sources(conn: duckdb.DuckDBPyConnection):
+    """Print breakdown by source."""
+    result = conn.execute("""
+        SELECT
+            source,
+            COUNT(DISTINCT session_id) as sessions,
+            COUNT(*) as api_calls,
+            SUM(input_tokens) as inp,
+            SUM(output_tokens) as out,
+            SUM(cache_write_5m_tokens) as cw5m,
+            SUM(cache_write_1h_tokens) as cw1h,
+            SUM(cache_read_tokens) as cr,
+            FIRST(model) as model,
+            SUM(CASE WHEN is_subagent THEN 1 ELSE 0 END) as subagent_calls
+        FROM usage
+        GROUP BY source
+        ORDER BY SUM(input_tokens + output_tokens) DESC
+    """).fetchall()
+
+    if not result:
+        print("\n  No data.")
+        return
+
+    total_cost = 0.0
+    rows = []
+    for source, sessions, calls, inp, out, cw5m, cw1h, cr, model, sub_calls in result:
+        rates = get_pricing(model or "unknown")
+        cost = compute_cost(inp, out, cw5m, cw1h, cr, rates)
+        total_cost += cost
+        rows.append([
+            source,
+            str(sessions),
+            str(calls),
+            str(sub_calls),
+            _fmt_tokens(inp + cw5m + cw1h + cr),
+            _fmt_tokens(out),
+            _fmt_cost(cost),
+        ])
+
+    print(f"\n  Total cost across sources: {_fmt_cost(total_cost)}\n")
+    headers = ["Source", "Sessions", "Calls", "Subagent", "In+Cache", "Output", "Cost"]
+    _table(headers, rows, ["l", "r", "r", "r", "r", "r", "r"])
+    print()
