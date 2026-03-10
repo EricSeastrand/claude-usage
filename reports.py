@@ -1,7 +1,8 @@
 """Report formatting for Claude Code usage analysis."""
 
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
+from itertools import groupby as _groupby
 from typing import Generator
 
 import duckdb
@@ -711,6 +712,162 @@ def print_efficiency(conn: duckdb.DuckDBPyConnection):
             ])
         headers = ["Week", "Sessions", "Compacted", "Cost"]
         _table(headers, rows, ["l", "r", "r", "r"])
+        print()
+
+
+def print_segments(conn: duckdb.DuckDBPyConnection):
+    """Print context quality analysis by splitting sessions at compaction boundaries."""
+    # Get all non-subagent sessions with their turns
+    sessions = conn.execute("""
+        SELECT
+            session_id,
+            turn_number,
+            timestamp,
+            effective_context
+        FROM usage
+        WHERE NOT is_subagent
+        ORDER BY session_id, turn_number
+    """).fetchall()
+
+    if not sessions:
+        print("\n  No usage data found.")
+        return
+
+    # Get compaction boundaries
+    compactions = conn.execute("""
+        SELECT session_id, turn_number
+        FROM compactions
+        ORDER BY session_id, turn_number
+    """).fetchall()
+
+    # Index compaction turns by session
+    comp_by_session = defaultdict(list)
+    for sid, turn in compactions:
+        comp_by_session[sid].append(turn)
+
+    # Build segments: group turns by session, split at compaction boundaries
+    segments = []  # list of (session_id, seg_idx, peak_ctx, turns, start_ts, end_ts)
+
+    for sid, group in _groupby(sessions, key=lambda r: r[0]):
+        turns = list(group)
+        boundaries = sorted(comp_by_session.get(sid, []))
+
+        # Split turns into segments at compaction boundaries
+        # Segment 0: all turns before first compaction
+        # Segment 1: turns after first compaction, before second, etc.
+        seg_idx = 0
+        seg_turns = []
+
+        for _sid, turn_num, ts, eff_ctx in turns:
+            # Check if this turn crosses a compaction boundary
+            while boundaries and turn_num > boundaries[0]:
+                # Flush current segment
+                if seg_turns:
+                    peak = max(t[1] for t in seg_turns)
+                    segments.append((sid, seg_idx, peak, len(seg_turns),
+                                     seg_turns[0][0], seg_turns[-1][0]))
+                seg_turns = []
+                seg_idx += 1
+                boundaries.pop(0)
+
+            seg_turns.append((ts, eff_ctx))
+
+        # Flush final segment
+        if seg_turns:
+            peak = max(t[1] for t in seg_turns)
+            segments.append((sid, seg_idx, peak, len(seg_turns),
+                             seg_turns[0][0], seg_turns[-1][0]))
+
+    if not segments:
+        print("\n  No segments found.")
+        return
+
+    # --- Aggregate stats ---
+    total_segments = len(segments)
+    total_sessions = len(set(s[0] for s in segments))
+    peaks = [s[2] for s in segments]
+    peaks.sort()
+
+    # Quality thresholds
+    under_80k = sum(1 for p in peaks if p < 80_000)
+    under_120k = sum(1 for p in peaks if p < 120_000)
+    under_160k = sum(1 for p in peaks if p < 160_000)
+
+    median_peak = peaks[len(peaks) // 2]
+    mean_peak = sum(peaks) // len(peaks)
+
+    print(f"\n  {total_segments} segments across {total_sessions} sessions")
+    print(f"  Median peak context: {_fmt_tokens(median_peak)}")
+    print(f"  Mean peak context:   {_fmt_tokens(mean_peak)}")
+    print()
+    print(f"  Quality scores:")
+    print(f"    Under 80K:  {under_80k}/{total_segments} ({under_80k/total_segments*100:.1f}%)")
+    print(f"    Under 120K: {under_120k}/{total_segments} ({under_120k/total_segments*100:.1f}%)")
+    print(f"    Under 160K: {under_160k}/{total_segments} ({under_160k/total_segments*100:.1f}%)")
+    print()
+
+    # --- Histogram ---
+    buckets = [
+        (0, 20_000, "0-20K"),
+        (20_000, 40_000, "20-40K"),
+        (40_000, 60_000, "40-60K"),
+        (60_000, 80_000, "60-80K"),
+        (80_000, 100_000, "80-100K"),
+        (100_000, 120_000, "100-120K"),
+        (120_000, 140_000, "120-140K"),
+        (140_000, 160_000, "140-160K"),
+        (160_000, 180_000, "160-180K"),
+        (180_000, 200_000, "180-200K"),
+        (200_000, float("inf"), "200K+"),
+    ]
+
+    print("  Peak context distribution:")
+    print()
+    max_count = 0
+    bucket_counts = []
+    for lo, hi, label in buckets:
+        count = sum(1 for p in peaks if lo <= p < hi)
+        bucket_counts.append((label, count))
+        max_count = max(max_count, count)
+
+    bar_max = 40
+    for label, count in bucket_counts:
+        if count == 0 and label in ("180-200K", "200K+"):
+            continue  # skip empty high buckets
+        bar_len = int((count / max_count) * bar_max) if max_count > 0 else 0
+        bar = "#" * bar_len
+        pct = count / total_segments * 100
+        print(f"  {label:>8s}  {bar:<{bar_max}s}  {count:3d} ({pct:.0f}%)")
+
+    print()
+
+    # --- Trend: segments by week ---
+    weekly = defaultdict(lambda: {"peaks": [], "turns": []})
+    for sid, seg_idx, peak, turns, start_ts, end_ts in segments:
+        if start_ts:
+            # Truncate to Monday
+            dt = start_ts
+            monday = dt - timedelta(days=dt.weekday())
+            week_key = monday.strftime("%Y-%m-%d")
+            weekly[week_key]["peaks"].append(peak)
+            weekly[week_key]["turns"].append(turns)
+
+    if len(weekly) > 1:
+        print("  Weekly trend:")
+        print()
+        rows = []
+        for week in sorted(weekly.keys())[-8:]:
+            w = weekly[week]
+            wp = sorted(w["peaks"])
+            med = wp[len(wp) // 2]
+            n = len(wp)
+            u80 = sum(1 for p in wp if p < 80_000)
+            pct = f"{u80/n*100:.0f}%"
+            avg_turns = sum(w["turns"]) // n
+            rows.append([week, str(n), _fmt_tokens(med), pct, str(avg_turns)])
+
+        headers = ["Week", "Segments", "Median Peak", "<80K", "Avg Turns"]
+        _table(headers, rows, ["l", "r", "r", "r", "r"])
         print()
 
 

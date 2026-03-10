@@ -14,6 +14,7 @@ Usage:
     .venv/bin/python -m claude_usage compactions [--hours N | --date YYYY-MM-DD | --all] [--all-sources]
     .venv/bin/python -m claude_usage context <id-prefix> [--path DIR]
     .venv/bin/python -m claude_usage efficiency [--hours N | --date YYYY-MM-DD | --all] [--all-sources]
+    .venv/bin/python -m claude_usage segments [--hours N | --date YYYY-MM-DD | --all] [--all-sources]
     .venv/bin/python -m claude_usage sources [--hours N | --date YYYY-MM-DD | --all]
 """
 
@@ -35,6 +36,7 @@ from .reports import (
     print_efficiency,
     print_grep_results,
     print_search,
+    print_segments,
     print_session_detail,
     print_sessions,
     print_sources,
@@ -165,6 +167,12 @@ def main():
     _add_common_flags(p_eff)
     _add_source_flags(p_eff)
 
+    # segments (new)
+    p_seg = subparsers.add_parser("segments", help="Context quality analysis by compaction segments")
+    _add_time_flags(p_seg)
+    _add_common_flags(p_seg)
+    _add_source_flags(p_seg)
+
     # sources (new)
     p_src = subparsers.add_parser("sources", help="Breakdown by source (or 'sources init' to create config)")
     p_src.add_argument("action", nargs="?", default=None, help="'init' to create sample config file")
@@ -226,6 +234,8 @@ def main():
         print_context_growth(conn, args.id)
     elif args.command == "efficiency":
         print_efficiency(_load(args, include_subagents=True))
+    elif args.command == "segments":
+        print_segments(_load(args))
     elif args.command == "sources":
         if getattr(args, "action", None) == "init":
             print(init_config())
