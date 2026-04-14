@@ -1,13 +1,22 @@
 """Report formatting for Claude Code usage analysis."""
 
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from itertools import groupby as _groupby
 from typing import Generator
 
 import duckdb
 
 from .pricing import compute_cost, get_pricing
+
+
+def _to_local(dt: datetime) -> datetime:
+    """Convert a naive-UTC datetime (from DuckDB) to local time."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone()
 
 
 def _fmt_tokens(n: int) -> str:
@@ -141,7 +150,7 @@ def print_sessions(conn: duckdb.DuckDBPyConnection):
         cost = compute_cost(inp, out, cw5m, cw1h, cr, rates)
         total_cost += cost
 
-        time_str = started.strftime("%m-%d %H:%M") if started else "?"
+        time_str = _to_local(started).strftime("%m-%d %H:%M") if started else "?"
         prompt_snippet = (prompt or "")[:50]
         if len(prompt or "") > 50:
             prompt_snippet += "..."
@@ -264,7 +273,7 @@ def print_session_detail(conn: duckdb.DuckDBPyConnection, session_prefix: str):
     for ts, inp, out, cw5m, cw1h, cr in result:
         cost = compute_cost(inp, out, cw5m, cw1h, cr, rates)
         total_cost += cost
-        time_str = ts.strftime("%H:%M:%S") if ts else "?"
+        time_str = _to_local(ts).strftime("%H:%M:%S") if ts else "?"
         rows.append([
             time_str,
             _fmt_tokens(inp),
@@ -309,7 +318,7 @@ def print_search(conn: duckdb.DuckDBPyConnection, keyword: str):
     for sid, _proj, started, model, calls, inp, out, cw, cr, prompt in result:
         rates = get_pricing(model)
         cost = compute_cost(inp, out, cw, 0, cr, rates)
-        time_str = started.strftime("%m-%d %H:%M") if started else "?"
+        time_str = _to_local(started).strftime("%m-%d %H:%M") if started else "?"
         prompt_snippet = (prompt or "")[:60]
         if len(prompt or "") > 60:
             prompt_snippet += "..."
@@ -328,11 +337,12 @@ def print_search(conn: duckdb.DuckDBPyConnection, keyword: str):
 
 
 def _parse_ts(ts_str: str) -> datetime | None:
-    """Parse an ISO 8601 timestamp string."""
+    """Parse an ISO 8601 timestamp string, converting to local time."""
     if not ts_str:
         return None
     try:
-        return datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        utc = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        return utc.astimezone()
     except ValueError:
         return None
 
@@ -584,7 +594,7 @@ def print_context_growth(conn: duckdb.DuckDBPyConnection, session_prefix: str):
     max_bar = 50
     rows = []
     for turn, ts, eff_ctx, inp, cr, out, _model in result:
-        time_str = ts.strftime("%H:%M:%S") if ts else "?"
+        time_str = _to_local(ts).strftime("%H:%M:%S") if ts else "?"
         bar_len = int((eff_ctx / peak_ctx) * max_bar) if peak_ctx > 0 else 0
         bar = "#" * bar_len
 
