@@ -924,3 +924,167 @@ def print_sources(conn: duckdb.DuckDBPyConnection):
     headers = ["Source", "Sessions", "Calls", "Subagent", "In+Cache", "Output", "Cost"]
     _table(headers, rows, ["l", "r", "r", "r", "r", "r", "r"])
     print()
+
+
+# ---------------------------------------------------------------------------
+# Latency reports (backed by the `latency` table from claude_usage.latency)
+# ---------------------------------------------------------------------------
+
+
+def _short_model(model: str | None) -> str:
+    if not model:
+        return "-"
+    # Strip trailing date suffixes like -20250307 to keep columns narrow.
+    return model.split("-20")[0]
+
+
+def _fmt_secs(x: float | None) -> str:
+    if x is None:
+        return "-"
+    return f"{x:.2f}"
+
+
+def _fmt_num(x: float | None) -> str:
+    if x is None:
+        return "-"
+    return f"{x:.0f}"
+
+
+def print_latency_daily(conn: duckdb.DuckDBPyConnection):
+    """Per-day inference & tool-batch latency with output-token context."""
+    result = conn.execute("""
+        WITH daily AS (
+            SELECT
+                strftime(timestamp, '%Y-%m-%d') AS day,
+                inference_seconds, tool_batch_seconds,
+                output_tokens, cache_create_tokens, model
+            FROM latency
+            WHERE NOT is_subagent
+        ),
+        by_model AS (
+            SELECT day, model, COUNT(*) AS n,
+                   ROW_NUMBER() OVER (PARTITION BY day ORDER BY COUNT(*) DESC) AS rn
+            FROM daily
+            GROUP BY day, model
+        ),
+        top_model AS (SELECT day, model FROM by_model WHERE rn = 1)
+        SELECT
+            d.day,
+            COUNT(*) AS turns,
+            quantile_cont(d.inference_seconds, 0.5)                           AS inf_p50,
+            quantile_cont(d.inference_seconds, 0.95)                          AS inf_p95,
+            quantile_cont(d.tool_batch_seconds, 0.5)                          AS tool_p50,
+            quantile_cont(d.tool_batch_seconds, 0.95)                         AS tool_p95,
+            quantile_cont(d.output_tokens, 0.5)                               AS out_p50,
+            quantile_cont(d.output_tokens, 0.95)                              AS out_p95,
+            MAX(t.model)                                                      AS top_model
+        FROM daily d
+        LEFT JOIN top_model t USING (day)
+        GROUP BY d.day
+        ORDER BY d.day
+    """).fetchall()
+
+    rows = []
+    for day, turns, ip50, ip95, tp50, tp95, op50, op95, model in result:
+        rows.append([
+            day, str(turns),
+            _fmt_secs(ip50), _fmt_secs(ip95),
+            _fmt_secs(tp50), _fmt_secs(tp95),
+            _fmt_num(op50), _fmt_num(op95),
+            _short_model(model),
+        ])
+    print()
+    headers = ["Date", "Turns", "Inf p50", "Inf p95", "Tool p50", "Tool p95",
+               "Out p50", "Out p95", "Top model"]
+    _table(headers, rows, ["l", "r", "r", "r", "r", "r", "r", "r", "l"])
+    print()
+
+
+def print_latency_weekly(conn: duckdb.DuckDBPyConnection):
+    """Same metrics as daily, aggregated by ISO week."""
+    result = conn.execute("""
+        WITH weekly AS (
+            SELECT
+                strftime(timestamp, '%G-W%V') AS week,
+                inference_seconds, tool_batch_seconds,
+                output_tokens, model,
+                session_id
+            FROM latency
+            WHERE NOT is_subagent
+        ),
+        by_model AS (
+            SELECT week, model, COUNT(*) AS n,
+                   ROW_NUMBER() OVER (PARTITION BY week ORDER BY COUNT(*) DESC) AS rn
+            FROM weekly
+            GROUP BY week, model
+        ),
+        top_model AS (SELECT week, model FROM by_model WHERE rn = 1)
+        SELECT
+            w.week,
+            COUNT(DISTINCT w.session_id)                                       AS sessions,
+            COUNT(*)                                                           AS turns,
+            quantile_cont(w.inference_seconds, 0.5)                            AS inf_p50,
+            quantile_cont(w.inference_seconds, 0.95)                           AS inf_p95,
+            quantile_cont(w.tool_batch_seconds, 0.5)                           AS tool_p50,
+            quantile_cont(w.tool_batch_seconds, 0.95)                          AS tool_p95,
+            quantile_cont(w.output_tokens, 0.5)                                AS out_p50,
+            quantile_cont(w.output_tokens, 0.95)                               AS out_p95,
+            MAX(t.model)                                                       AS top_model
+        FROM weekly w
+        LEFT JOIN top_model t USING (week)
+        GROUP BY w.week
+        ORDER BY w.week
+    """).fetchall()
+
+    rows = []
+    for week, sessions, turns, ip50, ip95, tp50, tp95, op50, op95, model in result:
+        rows.append([
+            week, str(sessions), str(turns),
+            _fmt_secs(ip50), _fmt_secs(ip95),
+            _fmt_secs(tp50), _fmt_secs(tp95),
+            _fmt_num(op50), _fmt_num(op95),
+            _short_model(model),
+        ])
+    print()
+    headers = ["Week", "Sess", "Turns", "Inf p50", "Inf p95", "Tool p50", "Tool p95",
+               "Out p50", "Out p95", "Top model"]
+    _table(headers, rows, ["l", "r", "r", "r", "r", "r", "r", "r", "r", "l"])
+    print()
+
+
+def print_latency_tools(conn: duckdb.DuckDBPyConnection):
+    """Per-tool latency breakdown for assistant turns that fire a single tool.
+
+    We restrict to single-tool turns because tool_batch_seconds is a batch
+    wall-time bounded by the slowest tool — only meaningful as a per-tool
+    number when there's just one.
+    """
+    result = conn.execute("""
+        WITH single AS (
+            SELECT tool_names[1] AS tool, tool_batch_seconds AS t
+            FROM latency
+            WHERE tool_count = 1
+              AND tool_batch_seconds IS NOT NULL
+              AND NOT is_subagent
+        )
+        SELECT tool,
+               COUNT(*)                       AS calls,
+               quantile_cont(t, 0.5)          AS p50,
+               quantile_cont(t, 0.95)         AS p95,
+               MAX(t)                         AS max_s,
+               AVG(t)                         AS mean_s
+        FROM single
+        GROUP BY tool
+        HAVING COUNT(*) >= 5
+        ORDER BY COUNT(*) DESC
+        LIMIT 30
+    """).fetchall()
+
+    rows = [
+        [tool, str(calls), _fmt_secs(p50), _fmt_secs(p95), _fmt_secs(mx), _fmt_secs(mean)]
+        for tool, calls, p50, p95, mx, mean in result
+    ]
+    print()
+    headers = ["Tool", "Calls", "p50 (s)", "p95 (s)", "Max (s)", "Mean (s)"]
+    _table(headers, rows, ["l", "r", "r", "r", "r", "r"])
+    print()

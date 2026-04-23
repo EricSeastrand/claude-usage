@@ -36,7 +36,14 @@ Commands (run from ~):
   claude-usage/.venv/bin/python -m claude_usage compactions [--hours N | --all] [--all-sources]
   claude-usage/.venv/bin/python -m claude_usage context <id-prefix>
   claude-usage/.venv/bin/python -m claude_usage efficiency [--hours N | --all] [--all-sources]
+  claude-usage/.venv/bin/python -m claude_usage latency [--hours N | --all] [--tools | --weekly] [--all-sources]
   claude-usage/.venv/bin/python -m claude_usage sources [--hours N | --all]
+
+`latency` reports wall-clock p50/p95 for inference (user→assistant) and tool
+batches (assistant→tool_result) per day, plus the top model for that day —
+useful for spotting step-changes from model rollouts. `--tools` gives per-tool
+p50/p95/max (single-tool turns only). `--weekly` aggregates by ISO week.
+Default window is 30 days.
 
 All commands accept --path DIR to analyze sessions from a different Claude projects directory.
 Multi-source commands accept --all-sources or --source <name> to query remote hosts via SSHFS.
@@ -89,7 +96,7 @@ claude-usage summary --source my-server  # just one source
 
 ## Development notes
 
-- Core CLI: `__main__.py`, `loader.py`, `reports.py`, `pricing.py`, `sources.py`
+- Core CLI: `__main__.py`, `loader.py`, `reports.py`, `pricing.py`, `sources.py`, `latency.py`
 - Standalone analysis scripts (not part of core CLI): `deep_analysis.py`, `efficiency_analysis.py`, `jump_analysis.py`, `tool_size_analysis.py`
 - Dependencies: duckdb, pyarrow
 - Session files live in `~/.claude/projects/<project-path>/` as JSONL

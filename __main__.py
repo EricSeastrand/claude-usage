@@ -15,12 +15,14 @@ Usage:
     .venv/bin/python -m claude_usage context <id-prefix> [--path DIR]
     .venv/bin/python -m claude_usage efficiency [--hours N | --date YYYY-MM-DD | --all] [--all-sources]
     .venv/bin/python -m claude_usage segments [--hours N | --date YYYY-MM-DD | --all] [--all-sources]
+    .venv/bin/python -m claude_usage latency [--hours N | --date YYYY-MM-DD | --all] [--tools | --weekly] [--all-sources]
     .venv/bin/python -m claude_usage sources [--hours N | --date YYYY-MM-DD | --all]
 """
 
 import argparse
 import sys
 
+from .latency import load_latency_multi_source, load_latency_records
 from .loader import (
     discover_session_files,
     find_session_file,
@@ -35,6 +37,9 @@ from .reports import (
     print_daily,
     print_efficiency,
     print_grep_results,
+    print_latency_daily,
+    print_latency_tools,
+    print_latency_weekly,
     print_search,
     print_segments,
     print_session_detail,
@@ -173,6 +178,23 @@ def main():
     _add_common_flags(p_seg)
     _add_source_flags(p_seg)
 
+    # latency (new)
+    p_lat = subparsers.add_parser(
+        "latency",
+        help="Inference and tool-call latency trends",
+    )
+    lat_time = p_lat.add_mutually_exclusive_group()
+    lat_time.add_argument("--hours", type=int, default=30 * 24,
+                          help="Hours to look back (default: 30 days)")
+    lat_time.add_argument("--date", type=str, help="Specific date (YYYY-MM-DD)")
+    lat_time.add_argument("--all", action="store_true", help="All time, no filter")
+    p_lat.add_argument("--tools", action="store_true",
+                       help="Per-tool latency breakdown (single-tool turns only)")
+    p_lat.add_argument("--weekly", action="store_true",
+                       help="Aggregate by ISO week instead of by day")
+    _add_common_flags(p_lat)
+    _add_source_flags(p_lat)
+
     # sources (new)
     p_src = subparsers.add_parser("sources", help="Breakdown by source (or 'sources init' to create config)")
     p_src.add_argument("action", nargs="?", default=None, help="'init' to create sample config file")
@@ -236,6 +258,37 @@ def main():
         print_efficiency(_load(args, include_subagents=True))
     elif args.command == "segments":
         print_segments(_load(args))
+    elif args.command == "latency":
+        use_multi = getattr(args, "all_sources", False) or getattr(args, "source", None)
+        time_kwargs = _resolve_time(args)
+        if use_multi:
+            source_files = discover_all_sources(
+                source_name=getattr(args, "source", None),
+                include_subagents=False,
+                **time_kwargs,
+            )
+            if not source_files:
+                print("\n  No session files found across sources.")
+                sys.exit(0)
+            conn = load_latency_multi_source(source_files)
+        else:
+            time_kwargs["path"] = custom_path
+            files = discover_session_files(**time_kwargs)
+            if not files:
+                print("\n  No session files found matching your filter.")
+                sys.exit(0)
+            conn = load_latency_records(files)
+
+        if conn is None:
+            print("\n  No latency records extracted from session files.")
+            sys.exit(0)
+
+        if args.tools:
+            print_latency_tools(conn)
+        elif args.weekly:
+            print_latency_weekly(conn)
+        else:
+            print_latency_daily(conn)
     elif args.command == "sources":
         if getattr(args, "action", None) == "init":
             print(init_config())
